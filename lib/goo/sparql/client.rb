@@ -252,20 +252,26 @@ module Goo
       def execute_append_request(graph, data_file, mime_type_in)
         params = params_for_backend(graph, data_file, mime_type_in)
         if ENV["USE_DIGEST_AUTH"]
-          uri = URI(params[:url])
-          http = Net::HTTP.new(uri.host, uri.port)
-          http.use_ssl = (uri.scheme == 'https')
-          challenge_res = http.request_head(uri.request_uri)
-          www_auth = challenge_res['www-authenticate']
-          digest_auth = Net::HTTP::DigestAuth.new
-          auth_header = digest_auth.auth_header(uri, www_auth, params[:method].to_s.upcase)
+          if !ENV['DB_USER'] || !ENV['DB_PASSWORD']
+            raise Exception, "Environment variables DB_USER and DB_PASSWORD must be set for digest authentication"
+          else
+            uri = URI(params[:url])
+            uri.user = ENV['DB_USER']
+            uri.password = ENV['DB_PASSWORD']
+            http = Net::HTTP.new(uri.host, uri.port)
+            http.use_ssl = (uri.scheme == 'https')
+            challenge_res = http.request_head(uri.request_uri)
+            www_auth = challenge_res['www-authenticate']
+            digest_auth = Net::HTTP::DigestAuth.new
+            auth_header = digest_auth.auth_header(uri, www_auth, 'POST')
 
-          post_req = Net::HTTP::Post.new(uri.request_uri)
-          post_req['Authorization'] = auth_header
-          post_req['content-type'] = params[:headers]["content-type"]
-          post_req['mime-type'] = params[:headers]["mime-type"]
-          post_req.body = params[:payload]
-          http.request(post_req)
+            post_req = Net::HTTP::Post.new(uri.request_uri)
+            post_req['Authorization'] = auth_header
+            post_req['content-type'] = params[:headers]["content-type"]
+            post_req['mime-type'] = params[:headers]["mime-type"]
+            post_req.body = params[:payload]
+            http.request(post_req)
+          end
         else
           RestClient::Request.execute(params_for_backend(graph, data_file, mime_type_in))
         end        
