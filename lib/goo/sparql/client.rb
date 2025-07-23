@@ -234,7 +234,13 @@ module Goo
           # for some reason \\\\ breaks parsing
           params[:payload][:data] = params[:payload][:data].split("\n").map { |x| x.sub("\\\\", "") }.join("\n")
         elsif Goo.backend_vo?
-          params[:url] = "#{url.parent}/sparql-graph-crud?graph=#{CGI.escape(graph.to_s)}"
+          if ENV["USE_DIGEST_AUTH"]
+            # Use digest-specific endpoint
+            params[:url] = "#{url.parent}sparql-graph-crud-auth?graph=#{CGI.escape(graph.to_s)}"
+          else
+            # Fallback for non-digest
+            params[:url] = "#{url.parent}/sparql-graph-crud?graph=#{CGI.escape(graph.to_s)}"
+          end
           params[:payload] = data_file
         else
           params[:url] << "?context=#{CGI.escape("<#{graph.to_s}>")}"
@@ -244,7 +250,26 @@ module Goo
       end
 
       def execute_append_request(graph, data_file, mime_type_in)
-        RestClient::Request.execute(params_for_backend(graph, data_file, mime_type_in))
+        params = params_for_backend(graph, data_file, mime_type_in)
+        if ENV["USE_DIGEST_AUTH"]
+          uri = URI(params[:url])
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.use_ssl = (uri.scheme == 'https')
+          challenge_res = http.request_head(uri.request_uri)
+          www_auth = challenge_res['www-authenticate']
+          digest_auth = Net::HTTP::DigestAuth.new
+          auth_header = digest_auth.auth_header(uri, www_auth, params[:method].to_s.upcase)
+
+          post_req = Net::HTTP::Post.new(uri.request_uri)
+          post_req['Authorization'] = auth_header
+          post_req['content-type'] = params[:headers]["content-type"]
+          post_req['mime-type'] = params[:headers]["mime-type"]
+          post_req.body = params[:payload]
+          http.request(post_req)
+        else
+          RestClient::Request.execute(params_for_backend(graph, data_file, mime_type_in))
+        end        
+        
       end
     end
   end
