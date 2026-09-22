@@ -80,7 +80,7 @@ module SOLR
 
     def search(query, params = {})
       params[:q] = query
-      @solr.get('select', params: params)
+      @solr.post('select', data: params)
     end
 
     def submit_search_query(query, params = {})
