@@ -111,6 +111,18 @@ class TestSolr < MiniTest::Unit::TestCase
     assert_nil field
   end
 
+  def test_search_long_filter
+    connector = @@connector
+
+    # A filter OR-ing hundreds of ontologies (e.g. all acronyms a user can
+    # read) outgrows Jetty's 8KB request header limit if sent in the URL
+    clauses = Array.new(1000) { |i| "id:\"doc_#{i}\"" }
+
+    resp = connector.search('*:*', fq: [clauses.join(' OR ')])
+
+    assert_equal 0, resp['response']['numFound']
+  end
+
   private
 
   def add_field(name, connector)
