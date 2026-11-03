@@ -1,9 +1,11 @@
 *.gem
 *.rbc
 *.swp
+sparql_query_counts.txt
 *.tags*
 .bundle
 .config
+.serena
 coverage
 InstalledFiles
 lib/bundler/man

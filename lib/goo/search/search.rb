@@ -85,6 +85,11 @@ module Goo
         end
       end
 
+      # Merge sub-objects into a single document. For example, OntologySubmission.ontology
+      # All Ontology object's properties are merged into a single document for OntologySubmission
+      # Solr datatypes are also added, i.e:
+      # {"name": "*_txt", "type": "text_general", stored: true, "multiValued": true}
+      # {"name": "*_text", "type": "text_general", stored: true, "multiValued": false },
       document = document.reduce({}) do |h, (k, v)|
         if v.is_a?(Hash)
           v.each { |k2, v2| h["#{k}_#{k2}".to_sym] = v2 }
@@ -114,14 +119,25 @@ module Goo
         !@model_settings[:search_collection].nil?
       end
 
-      def enable_indexing(collection_name, search_backend = :main, &block)
+      def enable_indexing(collection_name, search_backend = :main, target_collection: nil, bootstrap_collection: nil, num_shards: 1, replication_factor: 1, &block)
         @model_settings[:search_collection] = collection_name
 
         if block_given?
           # optional block to generate custom schema
-          Goo.add_search_connection(collection_name, search_backend, &block)
+          Goo.add_search_connection(collection_name,
+                                    search_backend,
+                                    target_collection: target_collection,
+                                    bootstrap_collection: bootstrap_collection,
+                                    num_shards: num_shards,
+                                    replication_factor: replication_factor,
+                                    &block)
         else
-          Goo.add_search_connection(collection_name, search_backend)
+          Goo.add_search_connection(collection_name,
+                                    search_backend,
+                                    target_collection: target_collection,
+                                    bootstrap_collection: bootstrap_collection,
+                                    num_shards: num_shards,
+                                    replication_factor: replication_factor)
         end
 
         after_save :index
@@ -162,9 +178,9 @@ module Goo
         search_client(connection_name).submit_search_query(query, params)
       end
 
-      def indexBatch(collection, connection_name = search_collection_name)
+      def indexBatch(collection, connection_name = search_collection_name, commit: true, commit_within: nil)
         docs = collection.map(&:indexable_object)
-        search_client(connection_name).index_document(docs)
+        search_client(connection_name).index_document(docs, commit: commit, commit_within: commit_within)
       end
 
       def unindexBatch(collection, connection_name = search_collection_name)

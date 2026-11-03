@@ -7,6 +7,109 @@ module Goo
   module SPARQL
     class Client < RSPARQL::Client
 
+      # Goo owns the Redis read-through cache (vanilla sparql-client has none). The cache is
+      # inert until a redis_cache is set (Goo.use_cache / set_sparql_cache wires it).
+      attr_reader :cache, :query_logger
+
+      def initialize(url, **options, &block)
+        @cache = Goo::SPARQL::Cache.new(redis_cache: options[:redis_cache])
+        @query_logger = Goo::SPARQL::QueryLogger.new # inert until Goo.set_query_logging wires it
+        super(url, **options, &block)
+      end
+
+      def redis_cache=(redis_cache)
+        @cache.redis_cache = redis_cache
+      end
+
+      def query_logger=(logger)
+        @query_logger = logger
+      end
+
+      # Redis read-through cache. On a hit return the cached solutions; on a miss run the
+      # query (vanilla #query via super) and cache its return value. No options[:cache_key]
+      # side-channel -- we cache exactly what super returned (fixes the fork's bug). The cache
+      # is inert when redis_cache is nil, so this is a passthrough when caching is off.
+      def query(query, **options)
+        # Only count toward the cache hit-rate when caching is actually on, so the ratio measures
+        # cache effectiveness rather than whether caching is enabled (see QueryLogger#around).
+        cache_on = !@cache.redis_cache.nil?
+        cached = @cache.get(query, options)
+        unless cached.nil?
+          Goo.tick_cache_hit # served from cache, no store round-trip (see Goo.tick_query_count)
+          return @query_logger.around(query, cached: true, user: options[:user],
+                                      count_cache: cache_on) { cached }
+        end
+
+        # The response byte count is only known after #response has run, so hand the logger a
+        # proc that reads the thread-local stash set there (thread-local => safe under a client
+        # shared across request threads).
+        Thread.current[:goo_last_response_bytes] = nil
+        @query_logger.around(query, cached: false, user: options[:user], count_cache: cache_on,
+                             bytes: -> { Thread.current[:goo_last_response_bytes] }) do
+          Goo.tick_query_count # a store-bound read (cache hits above don't tick)
+          # Protect the store round-trip with the SPARQL breaker (review D2): a slow/down endpoint
+          # fails fast (CircuitOpenError -> 503) instead of every worker blocking on the timeout.
+          # Off by default; plain pass-through when the breaker is disabled.
+          result = Goo::SPARQL::Resilience.protect_read(sparql_circuit, Goo::SPARQL::Resilience::SPARQL_ERRORS) { super }
+          @cache.store(query, options, result)
+          result
+        end
+      end
+
+      # Invalidate the written graph's cached queries AFTER the write commits (super). The fork
+      # invalidated BEFORE the write; after-write closes that specific stale-repopulation window.
+      # It narrows -- not eliminates -- the classic cache-aside race: a slow reader holding a
+      # pre-write result can still store it after this invalidation (self-heals on next write).
+      #
+      # Parity with the fork (de-fork review D8): an update goo cannot invalidate for -- no
+      # options[:graph], including plain string updates -- is unsupported while caching is on;
+      # fail loudly rather than silently leave stale cache entries behind.
+      def update(query, **options)
+        if @cache.redis_cache
+          q_opts = query.respond_to?(:options) ? query.options : {}
+          if !q_opts[:bypass_cache] && q_opts[:graph].nil?
+            raise Exception, "Unsupported cacheable query"
+          end
+        end
+
+        result = @query_logger.around(query, cached: false, user: options[:user]) do
+          Goo.tick_query_count
+          Goo::SPARQL::Resilience.protect_read(sparql_circuit, Goo::SPARQL::Resilience::SPARQL_ERRORS) { super }
+        end
+        if @cache.redis_cache && query.respond_to?(:options) && !query.options[:bypass_cache]
+          graph = query.options[:graph]
+          @cache.invalidate(graph.to_s) if graph
+        end
+        result
+      end
+
+      # Per-endpoint breaker name so a slow query endpoint doesn't trip the update endpoint's
+      # breaker (and vice versa).
+      def sparql_circuit
+        @sparql_circuit ||= "goo:sparql:#{url}"
+      end
+
+      # Vanilla sparql-client posts protocol-1.1 queries as `application/sparql-query` with a
+      # raw body, which 4store rejects ("only implements application/x-www-form-urlencoded").
+      # goo configures its clients with a form-urlencoded Content-Type; honor it by posting the
+      # query/update as form data, matching the behavior the NCBO fork carried.
+      def make_post_request(query, headers = {})
+        request = super
+        protocol = (options[:protocol] || RSPARQL::Client::DEFAULT_PROTOCOL).to_s
+        if protocol == '1.1' && self.headers.merge(headers)['Content-Type'] == 'application/x-www-form-urlencoded'
+          request.set_form_data({ (@op || :query) => query.to_s })
+        end
+        request
+      end
+
+      # Stash the raw response size so #query can log it (cleared per query in #query). Thread-
+      # local because the query client is shared across request threads.
+      def response(query, **options)
+        resp = super
+        Thread.current[:goo_last_response_bytes] = resp.body&.bytesize if resp.respond_to?(:body)
+        resp
+      end
+
       MIMETYPE_RAPPER_MAP = {
         "application/rdf+xml" => "rdfxml",
         "application/x-turtle" => "turtle",
@@ -83,7 +186,7 @@ module Goo
 
       def append_triples_batch(graph, triples, mime_type_in, current_line = 0)
         begin
-          puts "Appending triples in batch of #{triples.size} triples from line #{current_line}"
+          puts "Appending triples in batch of #{triples.size} triples from line #{current_line}" if Goo.data_load_debug?
           execute_append_request graph, triples.join, mime_type_in
         rescue RestClient::Exception => e
           puts "Error in appending triples request: #{e.response}"
@@ -119,20 +222,26 @@ module Goo
           chunk_lines = 500_000 # number of line
         end
 
-        file = File.foreach(bnodes_filter)
-        lines = []
-        line_count = 0
-        file.each_entry do |line|
-          lines << line
+        turtle_format = bnodes_filter.end_with?('ttl') || bnodes_filter.end_with?('n3')
 
-          if lines.size == chunk_lines
-            response = append_triples_batch(graph, lines, mime_type_in, line_count)
-            line_count += lines.size
-            lines.clear
+        if turtle_format
+          response = append_turtle_chunked(graph, bnodes_filter, mime_type_in, chunk_lines)
+        else
+          file = File.foreach(bnodes_filter, encoding: Encoding::UTF_8)
+          lines = []
+          line_count = 0
+          file.each_entry do |line|
+            lines << line
+
+            if lines.size == chunk_lines
+              response = append_triples_batch(graph, lines, mime_type_in, line_count)
+              line_count += lines.size
+              lines.clear
+            end
           end
-        end
 
-        response = append_triples_batch(graph, lines, mime_type_in, line_count) unless lines.empty?
+          response = append_triples_batch(graph, lines, mime_type_in, line_count) unless lines.empty?
+        end
 
         unless dir.nil?
           File.delete(bnodes_filter)
@@ -142,6 +251,41 @@ module Goo
             puts "Error deleting tmp file #{dir}"
             puts e.backtrace
           end
+        end
+        response
+      end
+
+      # Turtle-aware chunking: preserves prefix declarations and only splits
+      # at statement boundaries (lines ending with '.') to avoid sending
+      # malformed Turtle fragments to the triplestore.
+      def append_turtle_chunked(graph, file_path, mime_type_in, chunk_lines)
+        response = nil
+        prefixes = []
+        lines = []
+        line_count = 0
+
+        File.foreach(file_path, encoding: Encoding::UTF_8) do |line|
+          # Collect all prefix and base declarations
+          stripped = line.strip
+          if stripped.start_with?('@prefix', '@base', 'PREFIX', 'BASE')
+            prefixes << line
+            line_count += 1
+            next
+          end
+
+          lines << line
+
+          if lines.size >= chunk_lines && stripped.end_with?('.')
+            chunk = prefixes + lines
+            response = append_triples_batch(graph, chunk, mime_type_in, line_count)
+            line_count += lines.size
+            lines.clear
+          end
+        end
+
+        unless lines.empty?
+          chunk = prefixes + lines
+          response = append_triples_batch(graph, chunk, mime_type_in, line_count)
         end
         response
       end
