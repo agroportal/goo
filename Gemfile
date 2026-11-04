@@ -9,6 +9,7 @@ gem "request_store"
 
 group :test do
   gem "minitest", '< 5.0'
+  gem 'ontoportal_testkit', github: 'agroportal/ontoportal_testkit', branch: 'main'
   gem "pry"
   gem 'simplecov'
   gem 'simplecov-cobertura' # for submitting code coverage results to codecov.io
