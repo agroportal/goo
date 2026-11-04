@@ -21,17 +21,46 @@ module Goo
     @settings.goo_path_data       ||= ENV['GOO_PATH_DATA'] || '/data/'
     @settings.goo_path_update     ||= ENV['GOO_PATH_UPDATE'] || '/update/'
     @settings.search_server_url   ||= ENV['SEARCH_SERVER_URL'] || 'http://localhost:8983/solr'
+    @settings.solr_num_shards     ||= ENV['SOLR_NUM_SHARDS'] || 1
+    @settings.solr_replication_factor ||= ENV['SOLR_REPLICATION_FACTOR'] || 1
     @settings.goo_redis_host      ||= ENV['REDIS_HOST'] || 'localhost'
     @settings.goo_redis_port      ||= ENV['REDIS_PORT'] || 6379
     @settings.bioportal_namespace ||= ENV['BIOPORTAL_NAMESPACE'] || 'http://data.bioontology.org/'
-    @settings.query_logging       ||= ENV['QUERIES_LOGGING'] || false
-    @settings.query_logging_file  ||= ENV['QUERIES_LOGGING_FILE'] || './sparql.log'
+    # SPARQL query logging: goo default OFF, process-wide env opt-in. Parse truthiness rather
+    # than taking the raw string -- OP_QUERIES_LOGGING=false is a non-empty String and would
+    # otherwise turn logging ON (same treatment as use_cache below).
+    @settings.query_logging       ||= %w[1 true yes on].include?(ENV['OP_QUERIES_LOGGING'].to_s.strip.downcase)
+    @settings.query_logging_file  ||= ENV['OP_QUERIES_LOGGING_FILE'] || nil
+    # Query logs go on their own Redis instance by default (de-fork review D6a): maxmemory /
+    # allkeys-lru is per-INSTANCE and ignores key prefixes and db numbers, so sharing one
+    # instance lets log volume evict cache entries. Falls back to the cache Redis when unset.
+    @settings.query_logging_redis_host ||= ENV['OP_QUERIES_LOGGING_REDIS_HOST'] || nil
+    @settings.query_logging_redis_port ||= ENV['OP_QUERIES_LOGGING_REDIS_PORT'] || nil
+    # Ring-buffer depth / entry TTL. Raise max_logs above the query count of the request under
+    # investigation: one class-tree request is ~2000 reads, so too small a buffer means the
+    # request trims away the evidence you enabled logging to collect.
+    @settings.query_logging_max_logs ||= (ENV['OP_QUERIES_LOGGING_MAX_LOGS'] || 10_000).to_i
+    @settings.query_logging_ttl        ||= (ENV['OP_QUERIES_LOGGING_TTL'] || 86_400).to_i
     @settings.queries_debug       ||= ENV['QUERIES_DEBUG'] || false
+    # Bulk-load progress lines (one per triple batch). Parse truthiness rather than taking the
+    # raw string -- GOO_DATA_LOAD_DEBUG=false is a non-empty String and would otherwise turn the
+    # output ON (same treatment as query_logging above).
+    @settings.data_load_debug     ||= %w[1 true yes on].include?(ENV['GOO_DATA_LOAD_DEBUG'].to_s.strip.downcase)
+    # SPARQL query caching: goo default OFF; env-driven opt-in so production can flip caching
+    # without a code change (de-fork review D5).
+    @settings.use_cache           ||= %w[1 true yes on].include?(ENV['OP_USE_CACHE'].to_s.strip.downcase)
     @settings.slice_loading_size  ||= ENV['GOO_SLICES']&.to_i || 500
     puts "(GOO) >> Using RDF store (#{@settings.goo_backend_name}) #{@settings.goo_host}:#{@settings.goo_port}#{@settings.goo_path_query}"
     puts "(GOO) >> Using term search server at #{@settings.search_server_url}"
     puts "(GOO) >> Using Redis instance at #{@settings.goo_redis_host}:#{@settings.goo_redis_port}"
-    puts "(GOO) >> Using Query logging: #{@settings.query_logging_file}" if @settings.query_logging
+    puts "(GOO) >> SPARQL query caching enabled (OP_USE_CACHE)" if @settings.use_cache
+    if @settings.query_logging
+      log_redis = @settings.query_logging_redis_host ?
+        "#{@settings.query_logging_redis_host}:#{@settings.query_logging_redis_port || 6379}" :
+        "#{@settings.goo_redis_host}:#{@settings.goo_redis_port} (SHARED with cache -- see D6a)"
+      puts "(GOO) >> Using SPARQL query logging -> redis #{log_redis}" \
+           "#{@settings.query_logging_file ? " + file #{@settings.query_logging_file}" : ''}"
+    end
 
     connect_goo
   end
@@ -40,6 +69,7 @@ module Goo
     begin
       Goo.configure do |conf|
         conf.queries_debug(@settings.queries_debug)
+        conf.data_load_debug(@settings.data_load_debug)
         conf.add_sparql_backend(:main,
                                 backend_name: @settings.goo_backend_name,
                                 query: "http://#{@settings.goo_host}:#{@settings.goo_port}#{@settings.goo_path_query}",
@@ -48,7 +78,14 @@ module Goo
                                 options: { rules: :NONE})
         conf.add_search_backend(:main, service: @settings.search_server_url)
         conf.add_redis_backend(host: @settings.goo_redis_host, port: @settings.goo_redis_port)
-        conf.add_query_logger(enabled: @settings.query_logging, file: @settings.query_logging_file)
+        if @settings.query_logging_redis_host
+          conf.add_log_redis_backend(host: @settings.query_logging_redis_host,
+                                     port: @settings.query_logging_redis_port || 6379)
+        end
+        conf.enable_query_logging(enabled: @settings.query_logging,
+                                  file: @settings.query_logging_file,
+                                  max_logs: @settings.query_logging_max_logs,
+                                  ttl: @settings.query_logging_ttl)
 
         conf.add_namespace(:omv, RDF::Vocabulary.new("http://omv.org/ontology/"))
         conf.add_namespace(:skos, RDF::Vocabulary.new("http://www.w3.org/2004/02/skos/core#"))
@@ -61,28 +98,12 @@ module Goo
         conf.add_namespace(:tiger, RDF::Vocabulary.new("http://www.census.gov/tiger/2002/vocab#"))
         conf.add_namespace(:nemo, RDF::Vocabulary.new("http://purl.bioontology.org/NEMO/ontology/NEMO_annotation_properties.owl#"))
         conf.add_namespace(:bioportal, RDF::Vocabulary.new(@settings.bioportal_namespace))
-        conf.use_cache = false
+        conf.use_cache = @settings.use_cache
         conf.slice_loading_size = @settings.slice_loading_size
       end
     rescue StandardError => e
       abort("EXITING: Goo cannot connect to triplestore and/or search server:\n  #{e}\n#{e.backtrace.join("\n")}")
     end
-  end
-
-  # Test triplestores: localhost or a testkit "-ut" service (e.g. 4store-ut)
-  TEST_HOST_PATTERN = /localhost|-ut/
-
-  def self.test_reset
-    if @@sparql_backends[:main][:query].url.to_s[TEST_HOST_PATTERN].nil?
-      raise Exception, "only for testing"
-    end
-    @@sparql_backends = {}
-    Goo.add_sparql_backend(:main,
-                            backend_name: @settings.goo_backend_name,
-                            query: "http://#{@settings.goo_host}:#{@settings.goo_port}#{@settings.goo_path_query}",
-                            data: "http://#{@settings.goo_host}:#{@settings.goo_port}#{@settings.goo_path_data}",
-                            update: "http://#{@settings.goo_host}:#{@settings.goo_port}#{@settings.goo_path_update}",
-                            options: { rules: :NONE })
   end
 
 end

@@ -1,27 +1,22 @@
 require_relative 'test_case'
 require_relative 'models'
 
-class TestCache < MiniTest::Unit::TestCase
+class TestCache < Goo::TestCase
 
   def initialize(*args)
     super(*args)
   end
 
-  def self.before_suite
-    begin
-      Goo.use_cache=false
-      GooTestData.create_test_case_data
-      redis = Goo.redis_client
-      if redis.dbsize > 100
-        raise Exception, "This redis needs to point to testing server"
-      end
-      redis.flushdb
-    rescue Exception => e
-      puts e.backtrace
-    end
+  def before_all
+    Goo.use_cache=false
+    GooTestData.create_test_case_data
+    # Safe to flush: targets are host-checked and pre-flight-verified at suite startup
+    # (test_case.rb). The old dbsize>100 guard false-tripped here mid-run once earlier suites
+    # had legitimately filled the shared redis.
+    Goo.redis_client.flushdb
   end
 
-  def self.after_suite
+  def after_all
     Goo.use_cache=false
     GooTestData.delete_test_case_data
   end
@@ -42,11 +37,11 @@ class TestCache < MiniTest::Unit::TestCase
   def test_cache_models
     redis = Goo.redis_client
     redis.flushdb
-    assert !Goo.use_cache?
+    refute Goo.use_cache?
     Goo.use_cache=true
     assert Goo.use_cache?
     programs = Program.where(name: "BioInformatics", university: [ name: "Stanford"  ]).all
-    assert programs.length == 1
+    assert_equal 1, programs.length
     assert programs.first.id.to_s["Stanford/BioInformatics"]
     assert redis.exists("sparql:graph:http://goo.org/default/Program")
     queries = redis.smembers("sparql:graph:http://goo.org/default/Program")
@@ -58,8 +53,8 @@ class TestCache < MiniTest::Unit::TestCase
         key = q
       end
     end
-    assert count == 1
-    assert !key.nil?
+    assert_equal 1, count
+    refute_nil key
     assert redis.exists(key)
 
 
@@ -69,26 +64,26 @@ class TestCache < MiniTest::Unit::TestCase
     prg.save
 
     #invalidated ?
-    assert !redis.sismember("sparql:graph:http://goo.org/default/Program",key)
+    refute redis.sismember("sparql:graph:http://goo.org/default/Program",key)
     programs = Program.where(name: "BioInformatics", university: [ name: "Stanford"  ]).all
-    assert programs.length == 1
+    assert_equal 1, programs.length
     prg = programs.first
     prg.bring_remaining
 
     #change comes back ?
-    assert prg.credits == 999
+    assert_equal 999, prg.credits
     Goo.use_cache=false
   end
 
   def test_cache_models_back_door
     redis = Goo.redis_client
     redis.flushdb
-    assert !Goo.use_cache?
+    refute Goo.use_cache?
     Goo.use_cache=true
     assert Goo.use_cache?
     programs = Program.where(name: "BioInformatics", university: [ name: "Stanford"  ])
                           .include(:students).all
-    assert programs.length == 1
+    assert_equal 1, programs.length
     key = nil
     queries = redis.smembers("sparql:graph:http://goo.org/default/Program")
     count = 0
@@ -98,17 +93,17 @@ class TestCache < MiniTest::Unit::TestCase
         key = q
       end
     end
-    assert count == 1
-    assert !key.nil?
+    assert_equal 1, count
+    refute_nil key
     assert redis.exists(key)
     assert redis.sismember("sparql:graph:http://goo.org/default/Program",key)
 
     prg = programs.first
-    assert prg.students.length == 2
+    assert_equal 2, prg.students.length
     prg.students.each do |st|
       st.bring(:name)
     end
-    assert prg.students.map { |x| x.name }.sort == ["Daniel","Susan"]
+    assert_equal ["Daniel","Susan"], prg.students.map { |x| x.name }.sort
 
     data = "<http://goo.org/default/student/Tim> " +
            "<http://goo.org/default/enrolled> " +
@@ -118,18 +113,18 @@ class TestCache < MiniTest::Unit::TestCase
     programs = Program.where(name: "BioInformatics", university: [ name: "Stanford"  ])
                           .include(:students).all
     prg = programs.first
-    assert prg.students.length == 3
+    assert_equal 3, prg.students.length
     prg.students.each do |st|
       st.bring(:name)
     end
-    assert prg.students.map { |x| x.name }.sort == ["Daniel","Susan","Tim"]
+    assert_equal ["Daniel","Susan","Tim"], prg.students.map { |x| x.name }.sort
     Goo.use_cache=false
   end
 
   def test_cache_successful_hit
     redis = Goo.redis_client
     redis.flushdb
-    assert !Goo.use_cache?
+    refute Goo.use_cache?
     Goo.use_cache=true
     assert Goo.use_cache?
     programs = Program.where(name: "BioInformatics", university: [ name: "Stanford"  ])
@@ -144,8 +139,8 @@ class TestCache < MiniTest::Unit::TestCase
     begin
       programs = Program.where(name: "BioInformatics", university: [ name: "Stanford"  ])
                           .include(:students).all
-    rescue  Exception
-      assert false, "should be cached"
+    rescue Exception
+      flunk "should be cached"
     end
 
     #from cache
@@ -154,9 +149,37 @@ class TestCache < MiniTest::Unit::TestCase
       #different query
       programs = Program.where(name: "BioInformatics X", university: [ name: "Stanford"  ]).all
     end
-    Goo.test_reset
+    TestHelpers.test_reset
     Goo.use_cache=false
   end
 
+  # Goo::SPARQL::Client#update must invalidate the graph's cached queries AFTER the write
+  # commits, not before (the fork invalidated first, opening a stale-repopulation race --
+  # docs/sparql-client-defork-proposal.md §3.1). Record the order of the HTTP write vs. the
+  # cache invalidation around a real update and assert write-then-invalidate.
+  def test_invalidation_happens_after_write
+    Goo.use_cache = true
+    client = Goo.sparql_update_client
+    cache = client.cache
+    order = []
+
+    orig_invalidate = cache.method(:invalidate)
+    orig_write = client.method(:make_post_request)
+    cache.define_singleton_method(:invalidate) { |g| order << :invalidate; orig_invalidate.call(g) }
+    client.define_singleton_method(:make_post_request) { |q, h = {}| order << :write; orig_write.call(q, h) }
+
+    begin
+      stmt = RDF::Statement.new(RDF::URI("http://goo.org/default/order_subj"),
+                                RDF::URI("http://goo.org/default/order_pred"),
+                                RDF::URI("http://goo.org/default/order_obj"))
+      client.delete_data([stmt], graph: RDF::URI("http://goo.org/default/OrderTest"))
+    ensure
+      cache.singleton_class.send(:remove_method, :invalidate)
+      client.singleton_class.send(:remove_method, :make_post_request)
+      Goo.use_cache = false
+    end
+
+    assert_equal [:write, :invalidate], order
+  end
 
 end

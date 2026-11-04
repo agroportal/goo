@@ -1,6 +1,6 @@
 require_relative 'test_case'
 
-class TestConfig < MiniTest::Unit::TestCase
+class TestConfig < Goo::TestCase
 
   # Redis client must target the configured host (e.g. REDIS_HOST=redis-ut in containers)
   def test_redis_backend_host

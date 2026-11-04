@@ -16,7 +16,7 @@ module SOLR
         return is_list ? '*_texts' : '*_text' if is_fuzzy_search
 
         dynamic_type = case type
-                       when :uri, :string, nil
+                       when :uri, :url, :string, nil
                          '*_t'
                        when :integer
                          '*_i'
@@ -55,16 +55,20 @@ module SOLR
       @solr.optimize(:optimize_attributes => attrs || {})
     end
 
-    def index_document(document, commit: true)
-      @solr.add(document)
-      @solr.commit if commit
+    def index_document(document, commit: true, commit_within: nil)
+      add_attributes = {}
+
+      if commit && commit_within
+        add_attributes[:commitWithin] = commit_within
+      end
+
+      @solr.add(document, add_attributes: add_attributes)
+      @solr.commit if commit && commit_within.nil?
     end
 
     def index_document_attr(key, type, is_list, fuzzy_search)
       self.class.index_document_attr(key, type, is_list, fuzzy_search)
     end
-
-
 
     def delete_by_id(document_id, commit: true)
       return if document_id.nil?
@@ -79,30 +83,32 @@ module SOLR
     end
 
     def search(query, params = {})
-      params[:q] = query
-      @solr.post('select', data: params)
+      body = params.dup
+      body[:q] = query
+      @solr.post('select', data: body)
     end
 
     def submit_search_query(query, params = {})
       uri = ::URI.parse("#{collection_url}/select")
-
       http = Net::HTTP.new(uri.host, uri.port)
       request = Net::HTTP::Post.new(uri.request_uri)
 
+      params = params.dup
       params[:q] = query
+      params[:wt] ||= "json"
+
+      request["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+      request["X-Requested-With"] = "XMLHttpRequest" # helps when Solr CSRF filter is enabled
       request.set_form_data(params)
 
       response = http.request(request)
 
-      if response.is_a?(Net::HTTPSuccess)
-        JSON.parse(response.body)
-      else
-        puts "Error: #{response.code} - #{response.message}"
-        nil
+      unless response.is_a?(Net::HTTPSuccess)
+        raise "Solr query failed (HTTP #{response.code} #{response.message}): #{response.body}"
       end
-    end
 
+      JSON.parse(response.body)
+    end
 
   end
 end
-

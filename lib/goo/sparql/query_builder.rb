@@ -19,6 +19,7 @@ module Goo
         @internal_variables_map = {}
         @equivalent_predicates = options[:equivalent_predicates]
         @properties_to_include = options[:properties_to_include]
+        @union_with_bind = nil
         @query = get_client
       end
 
@@ -57,6 +58,9 @@ module Goo
 
         ids_filter(ids) if ids
 
+        # Inject the union-with-bind block last, after every #filter call above, so it
+        # renders after the real filters (matching the old fork DSL ordering).
+        apply_union_with_bind
 
         @query.order_by(*order_by_string) if @order_by
 
@@ -95,7 +99,18 @@ module Goo
           binding_as << [[[:inverseAttributeObject, :attributeProperty, :id]], { filters: inverse_filter}] unless inverse_filter.empty?
         end
 
-        @query.optional_union_with_bind_as(*binding_as) unless binding_as.empty?
+        @union_with_bind = Goo::SPARQL::Ext::UnionWithBind.new(binding_as) unless binding_as.empty?
+        self
+      end
+
+      # Stash the union-with-bind QueryElement so Goo::SPARQL::Ext::QuerySerialization renders
+      # it as the LAST thing inside the WHERE group -- after any where-pattern unions. Order
+      # matters: the block is an OPTIONAL (left-join), so placing it after the unions matches
+      # the original fork semantics (and result sets).
+      def apply_union_with_bind
+        return self if @union_with_bind.nil?
+
+        @query.options[:goo_union_with_bind] = @union_with_bind
         self
       end
 
@@ -156,13 +171,19 @@ module Goo
       end
 
       def ids_filter(ids)
-        filter_id = []
+        return self if ids.empty?
 
-        ids.each do |id|
-          filter_id << "?id = #{id.to_ntriples.to_s.gsub(' ', '%20').gsub("\\u0020", '%20')}"
+        if Goo.backend_4s?
+          filter = ids.map do |id|
+            "?id = #{id.to_ntriples.to_s.gsub(' ', '%20').gsub("\\u0020", '%20')}"
+          end
+          @query.filter filter.join(' || ')
+        else
+          values = ids.map do |id|
+            id.is_a?(RDF::URI) ? RDF::URI(id.to_s.gsub(' ', '%20')) : id
+          end
+          @query.values(:id, *values)
         end
-        filter_id_str = filter_id.join ' || '
-        @query.filter filter_id_str
         self
       end
 
@@ -454,4 +475,3 @@ module Goo
     end
   end
 end
-

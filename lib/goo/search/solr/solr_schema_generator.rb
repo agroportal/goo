@@ -8,10 +8,13 @@ module SOLR
       @schema = {}
     end
 
-    def add_field(name, type, indexed: true, stored: true, multi_valued: false, omit_norms: nil)
+    def add_field(name, type, indexed: true, stored: true, multi_valued: false, omit_norms: nil, default: nil)
       @schema['add-field'] ||= []
       af = { name: name.to_s, type: type, indexed: indexed, stored: stored, multiValued: multi_valued}
       af[:omitNorms] = omit_norms unless omit_norms.nil?
+      # Solr Schema API expects `default` as a STRING value; sending JSON booleans/numbers
+      # can trigger ClassCastException on Solr side.
+      af[:default] = default.is_a?(String) ? default : default.to_s unless default.nil?
       @schema['add-field'] << af
     end
 
@@ -72,21 +75,91 @@ module SOLR
             }
         },
         {
+          "name": "string_ci_exact",
+          "class": "solr.TextField",
+          "sortMissingLast": true,
+          "omitNorms": true,
+          "omitTermFreqAndPositions": true,
+          "queryAnalyzer":
+            {
+              "tokenizer": {
+                "class": "solr.KeywordTokenizerFactory"
+              },
+              "filters": [
+                {
+                  "class": "solr.LowerCaseFilterFactory"
+                }
+              ]
+            }
+        },
+        {
           "name": "text_suggest_ngram",
           "class": "solr.TextField",
           "positionIncrementGap": "100",
-          "analyzer": {
+          "indexAnalyzer": {
             "tokenizer": {
               "class": "solr.StandardTokenizerFactory"
             },
             "filters": [
               {
+                "class": "solr.WordDelimiterGraphFilterFactory",
+                "generateWordParts": "1",
+                "generateNumberParts": "1",
+                "catenateWords": "0",
+                "catenateNumbers": "0",
+                "catenateAll": "0",
+                "splitOnCaseChange": "1"
+              },
+              {
                 "class": "solr.LowerCaseFilterFactory"
               },
               {
-                "class": "solr.EdgeNGramTokenizerFactory",
+                "class": "solr.ASCIIFoldingFilterFactory"
+              },
+              {
+                "class": "solr.EdgeNGramFilterFactory",
                 "minGramSize": 1,
-                "maxGramSize": 25
+                "maxGramSize": 20
+              },
+              {
+                "class": "solr.PatternReplaceFilterFactory",
+                "pattern": "([^\\p{L}\\p{N}\\* ])",
+                "replacement": "",
+                "replace": "all"
+              }
+            ]
+          },
+          "queryAnalyzer": {
+            "tokenizer": {
+              "class": "solr.StandardTokenizerFactory"
+            },
+            "filters": [
+              {
+                "class": "solr.WordDelimiterGraphFilterFactory",
+                "generateWordParts": "0",
+                "generateNumberParts": "0",
+                "catenateWords": "0",
+                "catenateNumbers": "0",
+                "catenateAll": "0",
+                "splitOnCaseChange": "0"
+              },
+              {
+                "class": "solr.LowerCaseFilterFactory"
+              },
+              {
+                "class": "solr.ASCIIFoldingFilterFactory"
+              },
+              {
+                "class": "solr.PatternReplaceFilterFactory",
+                "pattern": "([^\\p{L}\\p{N}\\* ])",
+                "replacement": "",
+                "replace": "all"
+              },
+              {
+                "class": "solr.PatternReplaceFilterFactory",
+                "pattern": "^(.{20})(.*)?",
+                "replacement": "$1",
+                "replace": "all"
               }
             ]
           }
@@ -123,7 +196,7 @@ module SOLR
               },
               {
                 "class": "solr.PatternReplaceFilterFactory",
-                "pattern": "([^\\w\\d\\*æøåÆØÅ ])",
+                "pattern": "([^\\p{L}\\p{N}\\* ])",
                 "replacement": "",
                 "replace": "all"
               }
@@ -151,14 +224,8 @@ module SOLR
               },
               {
                 "class": "solr.PatternReplaceFilterFactory",
-                "pattern": "([^\\w\\d\\*æøåÆØÅ ])",
+                "pattern": "([^\\p{L}\\p{N}\\* ])",
                 "replacement": "",
-                "replace": "all"
-              },
-              {
-                "class": "solr.PatternReplaceFilterFactory",
-                "pattern": "^(.{30})(.*)?",
-                "replacement": "$1",
                 "replace": "all"
               }
             ]
@@ -195,7 +262,7 @@ module SOLR
               },
               {
                 "class": "solr.PatternReplaceFilterFactory",
-                "pattern": "([^\w\d*æøåÆØÅ ])",
+                "pattern": "([^\\p{L}\\p{N}\\* ])",
                 "replacement": " ",
                 "replace": "all"
               }
@@ -219,15 +286,14 @@ module SOLR
                 "catenateWords": "0",
                 "catenateNumbers": "0",
                 "catenateAll": "0",
-                "splitOnCaseChange": "0",
-                "splitOnNumerics": "0"
+                "splitOnCaseChange": "0"
               },
               {
                 "class": "solr.LowerCaseFilterFactory"
               },
               {
                 "class": "solr.PatternReplaceFilterFactory",
-                "pattern": "([^\w\d*æøåÆØÅ ])",
+                "pattern": "([^\\p{L}\\p{N}\\* ])",
                 "replacement": " ",
                 "replace": "all"
               }
@@ -240,7 +306,7 @@ module SOLR
     def init_fields
       [
         #{ name: "_version_", type: "plong", indexed: true, stored: true, multiValued: false },
-        { name: "resource_id", type: "string_ci", indexed: true, multiValued: false, required: true, stored: true },
+        { name: "resource_id", type: "string", indexed: true, multiValued: false, required: true, stored: true },
         { name: "resource_model", type: "string", indexed: true, multiValued: false, required: true, stored: false },
         { name: "_text_", type: "text_general", indexed: true, multiValued: true, stored: false },
       ]
@@ -258,6 +324,7 @@ module SOLR
         {"name": "*_bs", "type": "booleans", stored: true },
         {"name": "*_dt", "type": "pdate", stored: true },
         {"name": "*_dts", "type": "pdate", stored: true , multiValued: true},
+        {"name": "*_str", "type": "strings", indexed: false, stored: false },
         { "name": "*Exact", "type": "string_ci", "multiValued": true, stored: false },
         { "name": "*Suggest", "type": "text_suggest", "omitNorms": true, stored: false, "multiValued": true },
         { "name": "*SuggestEdge", "type": "text_suggest_edge", stored: false, "multiValued": true },
