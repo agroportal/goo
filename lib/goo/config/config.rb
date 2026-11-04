@@ -69,8 +69,11 @@ module Goo
     end
   end
 
+  # Test triplestores: localhost or a testkit "-ut" service (e.g. 4store-ut)
+  TEST_HOST_PATTERN = /localhost|-ut/
+
   def self.test_reset
-    if @@sparql_backends[:main][:query].url.to_s["localhost"].nil?
+    if @@sparql_backends[:main][:query].url.to_s[TEST_HOST_PATTERN].nil?
       raise Exception, "only for testing"
     end
     @@sparql_backends = {}
