@@ -8,6 +8,7 @@ Gem::Specification.new do |s|
   s.homepage = "http://github.com/ncbo/goo"
   s.add_dependency("activesupport")   # lib/goo/base/settings/settings.rb (core_ext/object/blank)
   s.add_dependency("addressable", "~> 2.8")
+  s.add_dependency("benchmark") # lib/goo/sparql/query_logger.rb; leaves Ruby's default gems in 4.0
   s.add_dependency("pry")
   s.add_dependency("rdf")
   s.add_dependency("rdf-vocab")
