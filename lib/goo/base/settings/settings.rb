@@ -1,3 +1,4 @@
+require 'active_support' # ActiveSupport 7+ needs it before any core_ext
 require 'active_support/core_ext/string'
 require 'active_support/core_ext/object/blank' # blank?/present? — no longer pulled in transitively by core_ext/string in activesupport 8
 require_relative 'yaml_settings'

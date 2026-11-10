@@ -5,7 +5,6 @@ plugins:
 # style guide on the test suite, not to roll out full RuboCop across goo.
 # Everything is disabled by default; only the Minitest department is enabled.
 AllCops:
-  TargetRubyVersion: 3.2
   SuggestExtensions: false
   DisabledByDefault: true
   Include:
